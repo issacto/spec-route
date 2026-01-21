@@ -51,7 +51,12 @@ impl RoutingTreeBuilder {
                     .collect::<Result<Vec<(&str, u16)>, ConfigurationError>>()?;
                 Box::new(RoundRobinRoute::new(servers))
             }
-            _ => unimplemented!(),
+            unsupported_type => {
+                return Err(ConfigurationError(format!(
+                    "Unsupported route type: {}",
+                    unsupported_type
+                )));
+            }
         };
 
         Ok(root)
