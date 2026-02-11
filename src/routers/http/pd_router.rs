@@ -2279,8 +2279,13 @@ impl RouterTrait for PDRouter {
             method, path
         );
 
-        // Get decode workers (for transparent proxy, we just forward to decode)
-        let decode_workers = self.worker_registry.get_decode_workers();
+        // Get decode workers, filtered by availability
+        let all_decode_workers = self.worker_registry.get_decode_workers();
+        let decode_workers: Vec<Arc<dyn Worker>> = all_decode_workers
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect();
 
         if decode_workers.is_empty() {
             return (
@@ -2290,9 +2295,21 @@ impl RouterTrait for PDRouter {
                 .into_response();
         }
 
-        // Select a decode worker using policy
+        // Select a decode worker using policy with headers for consistent hash
         let decode_policy = self.policy_registry.get_decode_policy();
-        let decode_idx = match decode_policy.select_worker(&decode_workers, None) {
+        let request_text = serde_json::to_string(&body).ok();
+        let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
+            h.iter()
+                .filter_map(|(name, value)| {
+                    value.to_str().ok().map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                })
+                .collect()
+        });
+        let decode_idx = match decode_policy.select_worker_with_headers(
+            &decode_workers,
+            request_text.as_deref(),
+            request_headers.as_ref(),
+        ) {
             Some(idx) => idx,
             None => {
                 return (

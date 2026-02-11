@@ -1511,14 +1511,25 @@ impl RouterTrait for VllmPDRouter {
                     .into_response();
             }
 
-            // Select workers using policy
+            // Select workers using policy with headers for consistent hash
             let request_text = serde_json::to_string(&request_json).ok();
             let request_str = request_text.as_deref();
+            let request_headers: Option<HashMap<String, String>> = headers.map(|h| {
+                h.iter()
+                    .filter_map(|(name, value)| {
+                        value.to_str().ok().map(|v| (name.as_str().to_lowercase(), v.to_string()))
+                    })
+                    .collect()
+            });
 
             let prefill_policy = self.policy_registry.get_prefill_policy();
             let decode_policy = self.policy_registry.get_decode_policy();
 
-            let prefill_idx = match prefill_policy.select_worker(&prefill_workers, request_str) {
+            let prefill_idx = match prefill_policy.select_worker_with_headers(
+                &prefill_workers,
+                request_str,
+                request_headers.as_ref(),
+            ) {
                 Some(idx) => idx,
                 None => {
                     return (
@@ -1529,7 +1540,11 @@ impl RouterTrait for VllmPDRouter {
                 }
             };
 
-            let decode_idx = match decode_policy.select_worker(&decode_workers, request_str) {
+            let decode_idx = match decode_policy.select_worker_with_headers(
+                &decode_workers,
+                request_str,
+                request_headers.as_ref(),
+            ) {
                 Some(idx) => idx,
                 None => {
                     return (

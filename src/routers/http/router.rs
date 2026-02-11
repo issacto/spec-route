@@ -1579,18 +1579,29 @@ impl RouterTrait for Router {
     ) -> Response {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
 
-        // Select a worker
-        let workers = self.worker_registry.get_all();
+        // Select a worker (filter by availability like select_worker_for_model)
+        let all_workers = self.worker_registry.get_all();
+        let workers: Vec<Arc<dyn Worker>> = all_workers
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect();
         if workers.is_empty() {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "No workers available".to_string(),
+                "No available workers".to_string(),
             )
                 .into_response();
         }
 
         let policy = self.policy_registry.get_default_policy();
-        let worker_idx = match policy.select_worker(&workers, None) {
+        let request_text = serde_json::to_string(&body).ok();
+        let request_headers = Self::headers_to_request_headers(headers);
+        let worker_idx = match policy.select_worker_with_headers(
+            &workers,
+            request_text.as_deref(),
+            request_headers.as_ref(),
+        ) {
             Some(idx) => idx,
             None => {
                 return (
