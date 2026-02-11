@@ -592,19 +592,21 @@ impl RouterTrait for RouterManager {
         body: &ChatCompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        // Select router based on headers and model
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        // Select router based on headers and model.
+        // When model is None, select_router_for_request considers all registered
+        // routers (including PD routers), so a single-model deployment will still
+        // route correctly even without the model field.
+        let model_id = body.model.as_deref();
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            // In multi-model mode, pass the model_id to the router
-            router.route_chat(headers, body, Some(&body.model)).await
+            router.route_chat(headers, body, model_id).await
         } else {
-            // Return 404 when the specified model is not found
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
+            let msg = match model_id {
+                Some(m) => format!("Model '{}' not found or no router available", m),
+                None => "No routers registered to handle this request".to_string(),
+            };
+            (StatusCode::NOT_FOUND, msg).into_response()
         }
     }
 
@@ -615,21 +617,21 @@ impl RouterTrait for RouterManager {
         body: &CompletionRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        // Select router based on headers and model
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        // Select router based on headers and model.
+        // When model is None, select_router_for_request considers all registered
+        // routers (including PD routers), so a single-model deployment will still
+        // route correctly even without the model field.
+        let model_id = body.model.as_deref();
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            // In multi-model mode, pass the model_id to the router
-            router
-                .route_completion(headers, body, Some(&body.model))
-                .await
+            router.route_completion(headers, body, model_id).await
         } else {
-            // Return 404 when the specified model is not found
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
+            let msg = match model_id {
+                Some(m) => format!("Model '{}' not found or no router available", m),
+                None => "No routers registered to handle this request".to_string(),
+            };
+            (StatusCode::NOT_FOUND, msg).into_response()
         }
     }
 
@@ -699,20 +701,20 @@ impl RouterTrait for RouterManager {
         body: &EmbeddingRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        // Select router based on headers and model
-        let router = self.select_router_for_request(headers, Some(&body.model));
+        // Select router based on headers and model.
+        // When model is None, select_router_for_request considers all registered
+        // routers, so a single-model deployment will still route correctly.
+        let model_id = body.model.as_deref();
+        let router = self.select_router_for_request(headers, model_id);
 
         if let Some(router) = router {
-            router
-                .route_embeddings(headers, body, Some(&body.model))
-                .await
+            router.route_embeddings(headers, body, model_id).await
         } else {
-            // Return 404 when the specified model is not found
-            (
-                StatusCode::NOT_FOUND,
-                format!("Model '{}' not found or no router available", body.model),
-            )
-                .into_response()
+            let msg = match model_id {
+                Some(m) => format!("Model '{}' not found or no router available", m),
+                None => "No routers registered to handle this request".to_string(),
+            };
+            (StatusCode::NOT_FOUND, msg).into_response()
         }
     }
 
