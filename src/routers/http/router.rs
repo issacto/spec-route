@@ -1579,18 +1579,29 @@ impl RouterTrait for Router {
     ) -> Response {
         debug!("Transparent proxy: routing {} {} to backend", method, path);
 
-        // Select a worker
-        let workers = self.worker_registry.get_all();
+        // Select a worker (filter by availability like select_worker_for_model)
+        let all_workers = self.worker_registry.get_all();
+        let workers: Vec<Arc<dyn Worker>> = all_workers
+            .iter()
+            .filter(|w| w.is_available())
+            .cloned()
+            .collect();
         if workers.is_empty() {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "No workers available".to_string(),
+                "No available workers".to_string(),
             )
                 .into_response();
         }
 
         let policy = self.policy_registry.get_default_policy();
-        let worker_idx = match policy.select_worker(&workers, None) {
+        let request_text = serde_json::to_string(&body).ok();
+        let request_headers = Self::headers_to_request_headers(headers);
+        let worker_idx = match policy.select_worker_with_headers(
+            &workers,
+            request_text.as_deref(),
+            request_headers.as_ref(),
+        ) {
             Some(idx) => idx,
             None => {
                 return (
@@ -1740,5 +1751,202 @@ mod tests {
             Router::wait_for_healthy_workers(&["http://nonexistent:8080".to_string()], 1, 1).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Timeout"));
+    }
+
+    // =============================
+    // Tests for transparent proxy header/availability fixes
+    // =============================
+
+    /// Create a test router with ConsistentHash policy instead of RoundRobin
+    fn create_test_consistent_hash_router() -> Router {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(
+            crate::config::types::PolicyConfig::ConsistentHash { virtual_nodes: 100 },
+        ));
+
+        let worker1 = BasicWorker::new("http://worker1:8080".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://worker2:8080".to_string(), WorkerType::Regular);
+        let worker3 = BasicWorker::new("http://worker3:8080".to_string(), WorkerType::Regular);
+        worker_registry.register(Arc::new(worker1));
+        worker_registry.register(Arc::new(worker2));
+        worker_registry.register(Arc::new(worker3));
+
+        let (_, rx) = tokio::sync::watch::channel(HashMap::new());
+        Router {
+            worker_registry,
+            policy_registry,
+            worker_startup_timeout_secs: 5,
+            worker_startup_check_interval_secs: 1,
+            intra_node_data_parallel_size: 1,
+            api_key: None,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            circuit_breaker_config: CircuitBreakerConfig::default(),
+            _worker_loads: Arc::new(rx),
+            _load_monitor_handle: None,
+        }
+    }
+
+    #[test]
+    fn test_headers_to_request_headers_basic() {
+        // Test that headers_to_request_headers correctly converts HeaderMap to HashMap
+        let mut header_map = HeaderMap::new();
+        header_map.insert("x-session-id", HeaderValue::from_static("session-123"));
+        header_map.insert("content-type", HeaderValue::from_static("application/json"));
+        header_map.insert("X-Custom-Header", HeaderValue::from_static("custom-value"));
+
+        let result = Router::headers_to_request_headers(Some(&header_map));
+        assert!(result.is_some());
+        let headers = result.unwrap();
+
+        // All keys should be lowercased
+        assert_eq!(headers.get("x-session-id").unwrap(), "session-123");
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(headers.get("x-custom-header").unwrap(), "custom-value");
+    }
+
+    #[test]
+    fn test_headers_to_request_headers_none() {
+        // Test that None headers produce None output
+        let result = Router::headers_to_request_headers(None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_headers_to_request_headers_empty() {
+        // Test that empty HeaderMap produces empty HashMap
+        let header_map = HeaderMap::new();
+        let result = Router::headers_to_request_headers(Some(&header_map));
+        assert!(result.is_some());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_select_worker_for_model_with_consistent_hash_uses_headers() {
+        // Verify that select_worker_for_model passes headers through to the policy,
+        // producing consistent routing for the same session ID
+        let router = create_test_consistent_hash_router();
+
+        let mut header_map = HeaderMap::new();
+        header_map.insert("x-session-id", HeaderValue::from_static("sticky-session-1"));
+
+        // Make multiple selections with the same headers - should all pick the same worker
+        let mut selected_urls: Vec<String> = Vec::new();
+        for _ in 0..10 {
+            let worker = router
+                .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
+                .expect("Should select a worker");
+            selected_urls.push(worker.url().to_string());
+        }
+
+        // All selections should go to the same worker (sticky routing)
+        let first = &selected_urls[0];
+        for (i, url) in selected_urls.iter().enumerate() {
+            assert_eq!(
+                url, first,
+                "Request {} routed to {}, expected {} (session stickiness broken)",
+                i, url, first
+            );
+        }
+    }
+
+    #[test]
+    fn test_select_worker_for_model_filters_unavailable_workers() {
+        // Verify that select_worker_for_model skips unhealthy workers
+        let router = create_test_consistent_hash_router();
+
+        // Mark worker1 and worker2 as unhealthy, leaving only worker3
+        let all_workers = router.worker_registry.get_all();
+        for w in &all_workers {
+            if w.url() == "http://worker1:8080" || w.url() == "http://worker2:8080" {
+                w.set_healthy(false);
+            }
+        }
+
+        let worker = router
+            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None)
+            .expect("Should select the remaining healthy worker");
+
+        assert_eq!(
+            worker.url(),
+            "http://worker3:8080",
+            "Should only select the healthy worker"
+        );
+    }
+
+    #[test]
+    fn test_select_worker_for_model_returns_none_when_all_unavailable() {
+        // Verify that when all workers are unhealthy, None is returned
+        let router = create_test_consistent_hash_router();
+
+        // Mark all workers as unhealthy
+        let all_workers = router.worker_registry.get_all();
+        for w in &all_workers {
+            w.set_healthy(false);
+        }
+
+        let result = router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None);
+        assert!(
+            result.is_none(),
+            "Should return None when all workers are unavailable"
+        );
+    }
+
+    #[test]
+    fn test_consistent_hash_different_sessions_can_route_differently() {
+        // Verify that different session IDs can route to different workers
+        let router = create_test_consistent_hash_router();
+
+        let mut worker_urls_seen = std::collections::HashSet::new();
+        for i in 0..50 {
+            let mut header_map = HeaderMap::new();
+            let session_id = format!("session-{}", i);
+            header_map.insert("x-session-id", HeaderValue::from_str(&session_id).unwrap());
+
+            if let Some(worker) = router.select_worker_for_model(
+                None,
+                Some(r#"{"prompt": "test"}"#),
+                Some(&header_map),
+            ) {
+                worker_urls_seen.insert(worker.url().to_string());
+            }
+        }
+
+        // With 50 different sessions and 3 workers, we should see at least 2 workers used
+        assert!(
+            worker_urls_seen.len() >= 2,
+            "Expected distribution across workers, only used: {:?}",
+            worker_urls_seen
+        );
+    }
+
+    #[test]
+    fn test_inline_header_conversion_matches_headers_to_request_headers() {
+        // Verify that the inline header conversion pattern used in pd_router and
+        // vllm_pd_router produces the same result as Router::headers_to_request_headers.
+        // This ensures consistency across all three router implementations.
+        let mut header_map = HeaderMap::new();
+        header_map.insert("X-Session-Id", HeaderValue::from_static("session-abc"));
+        header_map.insert("Content-Type", HeaderValue::from_static("application/json"));
+        header_map.insert("x-user-id", HeaderValue::from_static("user-42"));
+
+        // Method 1: Router::headers_to_request_headers (used in router.rs)
+        let method1 = Router::headers_to_request_headers(Some(&header_map)).unwrap();
+
+        // Method 2: Inline conversion (used in pd_router.rs and vllm_pd_router.rs)
+        let method2: HashMap<String, String> = header_map
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_lowercase(), v.to_string()))
+            })
+            .collect();
+
+        assert_eq!(
+            method1, method2,
+            "Both header conversion methods should produce identical results"
+        );
     }
 }
