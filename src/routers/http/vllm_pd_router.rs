@@ -7,6 +7,7 @@ use super::pd_router::PDRouter;
 use super::pd_types::{error_chain, PDRouterError};
 use super::vllm_service_discovery::{ServiceRegistry, ServiceType};
 use crate::core::{BasicWorker, Worker, WorkerType};
+use crate::metrics::RouterMetrics;
 use crate::policies::PolicyRegistry;
 use crate::routers::{RouterTrait, WorkerManagement};
 use async_trait::async_trait;
@@ -19,6 +20,7 @@ use axum::{
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -247,6 +249,7 @@ impl VllmPDRouter {
         );
 
         if prefill_instances.is_empty() || decode_instances.is_empty() {
+            RouterMetrics::record_pd_error("server_selection");
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 format!(
@@ -266,6 +269,7 @@ impl VllmPDRouter {
             match self.select_worker_with_policy(&prefill_instances, true, request_str) {
                 Some(idx) => idx,
                 None => {
+                    RouterMetrics::record_pd_error("server_selection");
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         "Prefill policy failed to select a worker".to_string(),
@@ -278,6 +282,7 @@ impl VllmPDRouter {
         {
             Some(idx) => idx,
             None => {
+                RouterMetrics::record_pd_error("server_selection");
                 return (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     "Decode policy failed to select a worker".to_string(),
@@ -341,6 +346,7 @@ impl VllmPDRouter {
         let (decode_http, decode_zmq) = decode_instance;
 
         debug!("ENTERED process_vllm_two_stage_request_discovered method");
+        let start_time = Instant::now();
         debug!(
             "Prefill: HTTP={}, ZMQ={}, Decode: HTTP={}, ZMQ={}, Path: {}",
             prefill_http, prefill_zmq, decode_http, decode_zmq, path
@@ -412,19 +418,33 @@ impl VllmPDRouter {
             );
         }
 
-        let prefill_response = prefill_request_builder
+        let prefill_response = match prefill_request_builder
             .body(prefill_request_str)
             .send()
             .await
-            .map_err(|e| {
+        {
+            Ok(resp) => resp,
+            Err(e) => {
                 let full_error = error_chain(&e);
-                format!("Prefill request failed to {}: {}", prefill_http, full_error)
-            })?;
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_prefill_error(prefill_http);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                return Err(format!(
+                    "Prefill request failed to {}: {}",
+                    prefill_http, full_error
+                ));
+            }
+        };
 
         let prefill_status = prefill_response.status();
         debug!("Prefill server responded with status: {}", prefill_status);
 
         if !prefill_status.is_success() {
+            let duration = start_time.elapsed();
+            RouterMetrics::record_pd_prefill_error(prefill_http);
+            RouterMetrics::record_pd_request(path);
+            RouterMetrics::record_pd_request_duration(path, duration);
             let error_body = prefill_response.text().await.unwrap_or_default();
             return Err(format!(
                 "Prefill server error {}: {}",
@@ -510,14 +530,21 @@ impl VllmPDRouter {
             );
         }
 
-        let decode_response = decode_request_builder
-            .body(decode_request_str)
-            .send()
-            .await
-            .map_err(|e| {
+        let decode_response = match decode_request_builder.body(decode_request_str).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
                 let full_error = error_chain(&e);
-                format!("Decode request failed to {}: {}", decode_http, full_error)
-            })?;
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_decode_error(decode_http);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_request(prefill_http);
+                return Err(format!(
+                    "Decode request failed to {}: {}",
+                    decode_http, full_error
+                ));
+            }
+        };
 
         debug!(
             "Decode server responded with status: {}",
@@ -527,6 +554,17 @@ impl VllmPDRouter {
         // Stop profiling on decode server after response received
         self.stop_profiling(&format!("http://{}", decode_base_http))
             .await;
+
+        // Record PD metrics
+        let duration = start_time.elapsed();
+        RouterMetrics::record_pd_request(path);
+        RouterMetrics::record_pd_request_duration(path, duration);
+        RouterMetrics::record_pd_prefill_request(prefill_http);
+        RouterMetrics::record_pd_decode_request(decode_http);
+
+        if !decode_response.status().is_success() {
+            RouterMetrics::record_pd_decode_error(decode_http);
+        }
 
         // Check if logprobs merging is needed
         let needs_logprobs = request_json.get("logprobs").is_some()
@@ -618,6 +656,7 @@ impl VllmPDRouter {
         headers: Option<&HeaderMap>,
     ) -> Result<Response, PDRouterError> {
         debug!("ENTERED process_vllm_two_stage_request method");
+        let start_time = Instant::now();
         debug!(
             "Prefill worker: {}, Decode worker: {}, Path: {}",
             prefill_worker.url(),
@@ -726,6 +765,10 @@ impl VllmPDRouter {
             Err(e) => {
                 prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
                 return Err(PDRouterError::NetworkError {
                     message: format!("Prefill request failed to {}: {}", prefill_url, full_error),
                 });
@@ -744,6 +787,10 @@ impl VllmPDRouter {
             Err(e) => {
                 prefill_worker.decrement_load();
                 let full_error = error_chain(&e);
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
                 return Err(PDRouterError::NetworkError {
                     message: format!(
                         "Failed to read prefill response from {}: {}",
@@ -769,6 +816,10 @@ impl VllmPDRouter {
             Ok(json) => json,
             Err(e) => {
                 prefill_worker.decrement_load();
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_prefill_error(&prefill_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
                 return Err(PDRouterError::NetworkError {
                     message: format!("Failed to parse prefill response as JSON: {}", e),
                 });
@@ -873,6 +924,11 @@ impl VllmPDRouter {
             Err(e) => {
                 decode_worker.decrement_load();
                 let full_error = error_chain(&e);
+                let duration = start_time.elapsed();
+                RouterMetrics::record_pd_decode_error(&decode_base_url);
+                RouterMetrics::record_pd_request(path);
+                RouterMetrics::record_pd_request_duration(path, duration);
+                RouterMetrics::record_pd_prefill_request(&prefill_base_url);
                 return Err(PDRouterError::NetworkError {
                     message: format!("Decode request failed to {}: {}", decode_url, full_error),
                 });
@@ -890,6 +946,17 @@ impl VllmPDRouter {
 
         info!("📥 Decode response status: {}", status);
         info!("📥 Decode response headers: {:?}", headers);
+
+        // Record PD metrics
+        let duration = start_time.elapsed();
+        RouterMetrics::record_pd_request(path);
+        RouterMetrics::record_pd_request_duration(path, duration);
+        RouterMetrics::record_pd_prefill_request(&prefill_base_url);
+        RouterMetrics::record_pd_decode_request(&decode_base_url);
+
+        if !status.is_success() {
+            RouterMetrics::record_pd_decode_error(&decode_base_url);
+        }
 
         // Check if logprobs merging is needed
         let needs_logprobs = original_request.get("logprobs").is_some()
@@ -1203,6 +1270,7 @@ impl RouterTrait for VllmPDRouter {
             );
 
             if prefill_workers.is_empty() || decode_workers.is_empty() {
+                RouterMetrics::record_pd_error("server_selection");
                 return (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     format!(
@@ -1238,6 +1306,7 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
+                    RouterMetrics::record_pd_error("server_selection");
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         "Prefill policy failed to select a worker".to_string(),
@@ -1253,6 +1322,7 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
+                    RouterMetrics::record_pd_error("server_selection");
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         "Decode policy failed to select a worker".to_string(),
@@ -1371,6 +1441,7 @@ impl RouterTrait for VllmPDRouter {
             );
 
             if prefill_workers.is_empty() || decode_workers.is_empty() {
+                RouterMetrics::record_pd_error("server_selection");
                 return (
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                     format!(
@@ -1406,6 +1477,7 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
+                    RouterMetrics::record_pd_error("server_selection");
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         "Prefill policy failed to select a worker".to_string(),
@@ -1421,6 +1493,7 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
+                    RouterMetrics::record_pd_error("server_selection");
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         "Decode policy failed to select a worker".to_string(),
@@ -1570,6 +1643,7 @@ impl RouterTrait for VllmPDRouter {
                 .collect();
 
             if prefill_workers.is_empty() || decode_workers.is_empty() {
+                RouterMetrics::record_pd_error("server_selection");
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     format!(
@@ -1605,6 +1679,7 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
+                    RouterMetrics::record_pd_error("server_selection");
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         "Prefill policy failed to select a worker".to_string(),
@@ -1620,6 +1695,7 @@ impl RouterTrait for VllmPDRouter {
             ) {
                 Some(idx) => idx,
                 None => {
+                    RouterMetrics::record_pd_error("server_selection");
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         "Decode policy failed to select a worker".to_string(),
