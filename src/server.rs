@@ -1,6 +1,6 @@
 use crate::{
-    config::{ConnectionMode, HistoryBackend, RouterConfig},
-    core::{WorkerRegistry, WorkerType},
+    config::{ConnectionMode, HistoryBackend, RateMonitorConfig, RouterConfig},
+    core::{WorkerRegistry, WorkerType, rate_monitor::RateMonitor},
     data_connector::{MemoryResponseStorage, NoOpResponseStorage, SharedResponseStorage},
     logging::{self, LoggingConfig},
     metrics::{self, PrometheusConfig},
@@ -14,10 +14,9 @@ use crate::{
         worker_spec::{WorkerApiResponse, WorkerConfigRequest, WorkerErrorResponse},
     },
     routers::{
-        router_manager::{RouterId, RouterManager},
-        RouterFactory, RouterTrait,
+        RouterFactory, RouterTrait, router_manager::{RouterId, RouterManager}
     },
-    service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
+    service_discovery::{ServiceDiscoveryConfig, start_service_discovery},
     tokenizer::{factory as tokenizer_factory, traits::Tokenizer},
 };
 use axum::{
@@ -118,6 +117,7 @@ pub struct AppState {
     pub context: Arc<AppContext>,
     pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
     pub router_manager: Option<Arc<RouterManager>>,
+    pub rate_monitor: Arc<RateMonitor>,
 }
 
 // Fallback handler for unmatched routes
@@ -930,6 +930,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.health_check.check_interval_secs
     );
 
+    let rate_monitor = Arc::new(RateMonitor::new(RateMonitorConfig {
+        threshold: 10,
+        window_secs: 60,
+        sustained_secs: 30,
+        vllm_base_args: vec![],
+    }));
+
+    let _rate_monitor_handle = app_context
+    .worker_registry
+    .start_rate_monitor(rate_monitor.clone());
+
     // Set up concurrency limiter with queue if configured
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),
@@ -946,12 +957,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         );
     }
 
+
+
     // Create app state with router and context
     let app_state = Arc::new(AppState {
         router,
         context: app_context.clone(),
         concurrency_queue_tx: limiter.queue_tx.clone(),
         router_manager,
+        rate_monitor: rate_monitor,
     });
     let router_arc = Arc::clone(&app_state.router);
 

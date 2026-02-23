@@ -411,6 +411,7 @@ pub async fn concurrency_limit_middleware(
     next: Next,
 ) -> Response {
     // Static counter for embeddings queue size
+    let rate = app_state.rate_monitor.record();
     static EMBEDDINGS_QUEUE_SIZE: AtomicU64 = AtomicU64::new(0);
 
     // Identify if this is an embeddings request based on path

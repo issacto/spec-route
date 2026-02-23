@@ -1314,3 +1314,21 @@ mod tests {
         }
     }
 }
+
+
+
+
+pub struct RateMonitorConfig {
+    /// Requests per window before triggering
+    pub threshold: usize,
+    /// Sliding window size
+    pub window_secs: u64,
+    /// How long above threshold before acting (debounce)
+    pub sustained_secs: u64,
+    /// vLLM args to use when restarting WITHOUT speculative decoding
+    pub vllm_base_args: Vec<String>,
+}
+
+pub struct RateMonitorHandle {
+    pub handle: tokio::task::JoinHandle<()>,
+}

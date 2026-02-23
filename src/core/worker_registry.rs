@@ -2,10 +2,13 @@
 //!
 //! Provides centralized registry for workers with model-based indexing
 
-use crate::core::{ConnectionMode, Worker, WorkerType};
+use crate::{config::{RateMonitorConfig, RateMonitorHandle}, core::{ConnectionMode, Worker, WorkerType}};
 use dashmap::DashMap;
 use std::sync::{Arc, RwLock};
 use uuid::Uuid;
+use crate::core::rate_monitor::{RateMonitor};
+
+
 
 /// Unique identifier for a worker
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
@@ -348,6 +351,11 @@ impl WorkerRegistry {
             prefill_workers: prefill_count,
             decode_workers: decode_count,
         }
+    }
+
+
+    pub fn start_rate_monitor(&self, monitor: Arc<RateMonitor>) -> RateMonitorHandle {
+        RateMonitor::start(monitor, self.workers.clone())
     }
 
     /// Start a health checker for all workers in the registry

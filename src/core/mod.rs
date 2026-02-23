@@ -24,3 +24,4 @@ pub use worker::{
     Worker, WorkerCollection, WorkerFactory, WorkerLoadGuard, WorkerType,
 };
 pub use worker_registry::{WorkerId, WorkerRegistry, WorkerRegistryStats};
+pub mod rate_monitor;
