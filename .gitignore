@@ -27,7 +27,8 @@ target
 .tokenizer_cache/
 # Python virtual environment
 .venv/
-
+venv/
+.venv/
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/
